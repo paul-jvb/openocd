@@ -415,6 +415,24 @@ static const struct kinetis_type kinetis_types_old[] = {
 
 static bool allow_fcf_writes;
 static uint8_t fcf_fopt = 0xff;
+
+/* External-watchdog /ST strobe config -- driven by the
+ * `kinetis ext_wdog_strobe` TCL command. When enabled, the
+ * PROGRAM_PHRASE SRAM loader toggles the configured GPIO every
+ * count iterations of its inner loop, so an external supervisor
+ * IC (e.g. MAX1232 wired to a chip GPIO) does not fire its watchdog
+ * mid-flash. */
+static struct {
+	bool     enabled;
+	uint32_t pcc;
+	uint32_t pcr;
+	uint32_t pddr;
+	uint32_t psor;
+	uint32_t ptor;
+	uint32_t mask;
+	uint32_t count_reload;
+} kinetis_ext_wdog_strobe;
+
 static bool create_banks;
 
 
@@ -1413,8 +1431,10 @@ static int kinetis_write_block_phrase(struct flash_bank *bank, const uint8_t *bu
 	struct kinetis_flash_bank *k_bank = bank->driver_priv;
 	uint32_t address = k_bank->prog_base + offset;
 	uint32_t end_address;
-	struct reg_param reg_params[5];
+	struct reg_param reg_params[6];
 	struct armv7m_algorithm armv7m_info;
+	struct working_area *strobe_cfg = NULL;
+	uint32_t strobe_cfg_addr = 0;
 	int retval;
 	uint8_t fstat;
 
@@ -1428,6 +1448,33 @@ static int kinetis_write_block_phrase(struct flash_bank *bank, const uint8_t *bu
 		sizeof(kinetis_phrase_write_code), kinetis_phrase_write_code);
 	if (retval != ERROR_OK)
 		return retval;
+
+	/* Allocate strobe config FIRST (32 bytes) so the source ring buffer
+	 * doesnt eat all the remaining working area. Order matters: source
+	 * sizes itself from  after this. */
+	if (kinetis_ext_wdog_strobe.enabled) {
+		if (target_alloc_working_area(target, 32, &strobe_cfg) != ERROR_OK) {
+			LOG_WARNING("no working area for strobe config; disabling strobe for this call");
+		} else {
+			uint8_t cfg[32];
+			buf_set_u32(cfg + 0,  0, 32, kinetis_ext_wdog_strobe.pcc);
+			buf_set_u32(cfg + 4,  0, 32, kinetis_ext_wdog_strobe.pcr);
+			buf_set_u32(cfg + 8,  0, 32, kinetis_ext_wdog_strobe.pddr);
+			buf_set_u32(cfg + 12, 0, 32, kinetis_ext_wdog_strobe.psor);
+			buf_set_u32(cfg + 16, 0, 32, kinetis_ext_wdog_strobe.ptor);
+			buf_set_u32(cfg + 20, 0, 32, kinetis_ext_wdog_strobe.mask);
+			buf_set_u32(cfg + 24, 0, 32, kinetis_ext_wdog_strobe.count_reload);
+			buf_set_u32(cfg + 28, 0, 32, kinetis_ext_wdog_strobe.count_reload);
+			retval = target_write_buffer(target, strobe_cfg->address, 32, cfg);
+			if (retval == ERROR_OK) {
+				strobe_cfg_addr = strobe_cfg->address;
+			} else {
+				LOG_WARNING("strobe config upload failed; disabling strobe for this call");
+				target_free_working_area(target, strobe_cfg);
+				strobe_cfg = NULL;
+			}
+		}
+	}
 
 	/* Ring buffer in remaining working area. Must be multiple of 8
 	 * (one phrase per ring-buffer slot). */
@@ -1454,16 +1501,18 @@ static int kinetis_write_block_phrase(struct flash_bank *bank, const uint8_t *bu
 	init_reg_param(&reg_params[2], "r2", 32, PARAM_OUT);    /* WA base */
 	init_reg_param(&reg_params[3], "r3", 32, PARAM_OUT);    /* WA end */
 	init_reg_param(&reg_params[4], "r4", 32, PARAM_OUT);    /* FTFx base */
+	init_reg_param(&reg_params[5], "r8", 32, PARAM_OUT);    /* strobe cfg or 0 */
 
 	buf_set_u32(reg_params[0].value, 0, 32, address);
 	buf_set_u32(reg_params[1].value, 0, 32, pcount);
 	buf_set_u32(reg_params[2].value, 0, 32, source->address);
 	buf_set_u32(reg_params[3].value, 0, 32, source->address + source->size);
 	buf_set_u32(reg_params[4].value, 0, 32, FTFX_FSTAT);
+	buf_set_u32(reg_params[5].value, 0, 32, strobe_cfg_addr);
 
 	retval = target_run_flash_async_algorithm(target, buffer, pcount, 8,
 						0, NULL,
-						5, reg_params,
+						6, reg_params,
 						source->address, source->size,
 						write_algorithm->address, 0,
 						&armv7m_info);
@@ -1482,12 +1531,15 @@ static int kinetis_write_block_phrase(struct flash_bank *bank, const uint8_t *bu
 
 	target_free_working_area(target, source);
 	target_free_working_area(target, write_algorithm);
+	if (strobe_cfg)
+		target_free_working_area(target, strobe_cfg);
 
 	destroy_reg_param(&reg_params[0]);
 	destroy_reg_param(&reg_params[1]);
 	destroy_reg_param(&reg_params[2]);
 	destroy_reg_param(&reg_params[3]);
 	destroy_reg_param(&reg_params[4]);
+	destroy_reg_param(&reg_params[5]);
 
 	return retval;
 }
@@ -3504,6 +3556,60 @@ COMMAND_HANDLER(kinetis_fcf_source_handler)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(kinetis_ext_wdog_strobe_handler)
+{
+	if (CMD_ARGC == 1 && strcmp(CMD_ARGV[0], "off") == 0) {
+		kinetis_ext_wdog_strobe.enabled = false;
+		command_print(CMD, "ext_wdog_strobe disabled");
+		return ERROR_OK;
+	}
+	if (CMD_ARGC == 0) {
+		command_print(CMD, "ext_wdog_strobe %s",
+			kinetis_ext_wdog_strobe.enabled ? "enabled" : "disabled");
+		return ERROR_OK;
+	}
+	if (CMD_ARGC < 2 || CMD_ARGC > 3)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	const char *p = CMD_ARGV[0];
+	if (strlen(p) >= 3 && (p[0] == 0x50 || p[0] == 0x70) && (p[1] == 0x54 || p[1] == 0x74))
+		p += 2;  /* skip leading PT / pt / Pt / pT */
+	char c = (*p >= 0x61 && *p <= 0x7A) ? (*p - 0x20) : *p;  /* uppercase */
+	if (c < 0x41 || c > 0x45) {  /* not A..E */
+		command_print(CMD, "port must be A..E (or PTA..PTE), got: %s", CMD_ARGV[0]);
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+	int port_idx = c - 0x41;
+
+	uint32_t pin;
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], pin);
+	if (pin > 31) {
+		command_print(CMD, "pin must be 0..31, got: %" PRIu32, pin);
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	}
+
+	uint32_t count = 32;
+	if (CMD_ARGC == 3)
+		COMMAND_PARSE_NUMBER(u32, CMD_ARGV[2], count);
+	if (count == 0) count = 1;
+
+	kinetis_ext_wdog_strobe.pcc  = 0x40065124 + 4 * port_idx;
+	kinetis_ext_wdog_strobe.pcr  = 0x40049000 + 0x1000 * port_idx + 4 * pin;
+	uint32_t gpio_base = 0x400FF000 + 0x40 * port_idx;
+	kinetis_ext_wdog_strobe.psor = gpio_base + 0x04;
+	kinetis_ext_wdog_strobe.ptor = gpio_base + 0x0C;
+	kinetis_ext_wdog_strobe.pddr = gpio_base + 0x14;
+	kinetis_ext_wdog_strobe.mask = 1u << pin;
+	kinetis_ext_wdog_strobe.count_reload = count;
+	kinetis_ext_wdog_strobe.enabled = true;
+
+	command_print(CMD,
+		"ext_wdog_strobe enabled: PT%c%" PRIu32 " (PTOR=0x%08" PRIx32 " mask=0x%" PRIx32 " every %" PRIu32 " iters)",
+		(char)(0x41 + port_idx), pin, kinetis_ext_wdog_strobe.ptor,
+		kinetis_ext_wdog_strobe.mask, kinetis_ext_wdog_strobe.count_reload);
+	return ERROR_OK;
+}
+
 COMMAND_HANDLER(kinetis_fopt_handler)
 {
 	if (CMD_ARGC > 1)
@@ -3591,6 +3697,13 @@ static const struct command_registration kinetis_exec_command_handlers[] = {
 			" Mode 'protection' is safe from unwanted locking of the device.",
 		.usage = "['protection'|'write']",
 		.handler = kinetis_fcf_source_handler,
+	},
+	{
+		.name = "ext_wdog_strobe",
+		.mode = COMMAND_ANY,
+		.help = "Toggle a GPIO every N PROGRAM_PHRASE loader iterations to satisfy an external watchdog supervisor (e.g. MAX1232 /ST). port = A..E or PTA..PTE; pin = 0..31; count default 32. Use off to disable.",
+		.usage = "<port> <pin> [count] | off",
+		.handler = kinetis_ext_wdog_strobe_handler,
 	},
 	{
 		.name = "fopt",
