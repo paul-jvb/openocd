@@ -23,6 +23,7 @@
 
 #include "jtag/interface.h"
 #include "imp.h"
+#include "target/image.h"
 #include <helper/binarybuffer.h>
 #include <helper/time_support.h>
 #include <target/target_type.h>
@@ -1320,6 +1321,11 @@ static const uint8_t kinetis_phrase_write_code[] = {
 #include "../../../contrib/loaders/flash/kinetis/kinetis_phrase.inc"
 };
 
+/* S32K1xx / KE15Z Program-Check Microcodes (PROGRAM_CHECK margin verify) */
+static const uint8_t kinetis_margin_check_code[] = {
+#include "../../../contrib/loaders/flash/kinetis/kinetis_margin_check.inc"
+};
+
 /* Program LongWord Block Write */
 static int kinetis_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		uint32_t offset, uint32_t wcount)
@@ -1543,6 +1549,243 @@ static int kinetis_write_block_phrase(struct flash_bank *bank, const uint8_t *bu
 
 	return retval;
 }
+
+/* Program Check (Margin Verify) Block (S32K1xx, KE15Z)
+ *
+ * Sister of kinetis_write_block_phrase() but for PROGRAM_CHECK
+ * (FCCOB cmd 0x02). Each loader iteration consumes ONE longword
+ * from the ring buffer (the expected data byte sequence from the
+ * source binary), issues PROGRAM_CHECK at `margin_level` against
+ * the corresponding flash address, and continues on success or
+ * aborts with rp = 0 on the first failure. Pins r8 to the same
+ * strobe-config struct as the PHRASE loader so the external-
+ * watchdog GPIO (if configured) stays toggled throughout the
+ * (potentially multi-second) verify pass.
+ *
+ * margin_level: 0x01 = USER margin, 0x02 = FACTORY margin.
+ * Margin 0x00 is reserved by the chip for this command -- per
+ * S32K1xx RM 31.4.12.3 the command rejects it with ACCERR.
+ */
+static int kinetis_margin_check_block(struct flash_bank *bank, const uint8_t *buffer,
+		uint32_t offset, uint32_t lwcount, uint8_t margin_level)
+{
+	struct target *target = bank->target;
+	uint32_t buffer_size;
+	struct working_area *write_algorithm;
+	struct working_area *source;
+	struct kinetis_flash_bank *k_bank = bank->driver_priv;
+	uint32_t address = k_bank->prog_base + offset;
+	uint32_t end_address;
+	struct reg_param reg_params[7];
+	struct armv7m_algorithm armv7m_info;
+	struct working_area *strobe_cfg = NULL;
+	uint32_t strobe_cfg_addr = 0;
+	int retval;
+
+	if (target_alloc_working_area(target, sizeof(kinetis_margin_check_code),
+			&write_algorithm) != ERROR_OK) {
+		LOG_WARNING("no working area available, can't do block margin check");
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+
+	retval = target_write_buffer(target, write_algorithm->address,
+		sizeof(kinetis_margin_check_code), kinetis_margin_check_code);
+	if (retval != ERROR_OK)
+		return retval;
+
+	/* Allocate strobe config FIRST (32 bytes) so the source ring buffer
+	 * doesn't eat all the remaining working area. */
+	if (kinetis_ext_wdog_strobe.enabled) {
+		if (target_alloc_working_area(target, 32, &strobe_cfg) != ERROR_OK) {
+			LOG_WARNING("no working area for strobe config; margin check will run without strobe");
+		} else {
+			uint8_t cfg[32];
+			buf_set_u32(cfg + 0,  0, 32, kinetis_ext_wdog_strobe.pcc);
+			buf_set_u32(cfg + 4,  0, 32, kinetis_ext_wdog_strobe.pcr);
+			buf_set_u32(cfg + 8,  0, 32, kinetis_ext_wdog_strobe.pddr);
+			buf_set_u32(cfg + 12, 0, 32, kinetis_ext_wdog_strobe.psor);
+			buf_set_u32(cfg + 16, 0, 32, kinetis_ext_wdog_strobe.ptor);
+			buf_set_u32(cfg + 20, 0, 32, kinetis_ext_wdog_strobe.mask);
+			buf_set_u32(cfg + 24, 0, 32, kinetis_ext_wdog_strobe.count_reload);
+			buf_set_u32(cfg + 28, 0, 32, kinetis_ext_wdog_strobe.count_reload);
+			retval = target_write_buffer(target, strobe_cfg->address, 32, cfg);
+			if (retval == ERROR_OK) {
+				strobe_cfg_addr = strobe_cfg->address;
+			} else {
+				LOG_WARNING("strobe config upload failed; running without strobe");
+				target_free_working_area(target, strobe_cfg);
+				strobe_cfg = NULL;
+			}
+		}
+	}
+
+	/* Ring buffer: 4 bytes per iteration. */
+	buffer_size = target_get_working_area_avail(target) & ~3;
+	if (buffer_size < 256) {
+		LOG_WARNING("large enough working area not available, can't do block margin check");
+		if (strobe_cfg) target_free_working_area(target, strobe_cfg);
+		target_free_working_area(target, write_algorithm);
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	} else if (buffer_size > 16384) {
+		buffer_size = 16384;
+	}
+
+	if (target_alloc_working_area(target, buffer_size, &source) != ERROR_OK) {
+		LOG_ERROR("allocating working area failed");
+		if (strobe_cfg) target_free_working_area(target, strobe_cfg);
+		target_free_working_area(target, write_algorithm);
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+
+	armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
+	armv7m_info.core_mode = ARM_MODE_THREAD;
+
+	init_reg_param(&reg_params[0], "r0", 32, PARAM_IN_OUT); /* flash addr */
+	init_reg_param(&reg_params[1], "r1", 32, PARAM_OUT);    /* longword count */
+	init_reg_param(&reg_params[2], "r2", 32, PARAM_OUT);    /* WA base */
+	init_reg_param(&reg_params[3], "r3", 32, PARAM_OUT);    /* WA end */
+	init_reg_param(&reg_params[4], "r4", 32, PARAM_OUT);    /* FTFx base */
+	init_reg_param(&reg_params[5], "r8", 32, PARAM_OUT);    /* strobe cfg or 0 */
+	init_reg_param(&reg_params[6], "r9", 32, PARAM_OUT);    /* margin level */
+
+	buf_set_u32(reg_params[0].value, 0, 32, address);
+	buf_set_u32(reg_params[1].value, 0, 32, lwcount);
+	buf_set_u32(reg_params[2].value, 0, 32, source->address);
+	buf_set_u32(reg_params[3].value, 0, 32, source->address + source->size);
+	buf_set_u32(reg_params[4].value, 0, 32, FTFX_FSTAT);
+	buf_set_u32(reg_params[5].value, 0, 32, strobe_cfg_addr);
+	buf_set_u32(reg_params[6].value, 0, 32, margin_level);
+
+	retval = target_run_flash_async_algorithm(target, buffer, lwcount, 4,
+						0, NULL,
+						7, reg_params,
+						source->address, source->size,
+						write_algorithm->address, 0,
+						&armv7m_info);
+
+	if (retval == ERROR_FLASH_OPERATION_FAILED) {
+		end_address = buf_get_u32(reg_params[0].value, 0, 32);
+		uint8_t fstat_at_fail = 0;
+		target_read_u8(target, FTFX_FSTAT, &fstat_at_fail);
+		LOG_ERROR("Margin verify FAILED at flash address 0x%08" PRIx32
+			" (margin level %u, FSTAT=0x%02x%s%s%s%s)",
+			end_address, margin_level, fstat_at_fail,
+			(fstat_at_fail & 0x20) ? " ACCERR" : "",
+			(fstat_at_fail & 0x10) ? " FPVIOL" : "",
+			(fstat_at_fail & 0x40) ? " RDCOLERR" : "",
+			(fstat_at_fail & 0x01) ? " MGSTAT0 (margin mismatch)" : "");
+		target_write_u8(target, FTFX_FSTAT, 0x70);
+		/* Preserve the failure status -- ERROR_FLASH_OPERATION_FAILED is
+		 * the correct caller signal regardless of which sub-bit fired. */
+	} else if (retval != ERROR_OK)
+		LOG_ERROR("Error executing kinetis margin-check algorithm");
+
+	target_free_working_area(target, source);
+	target_free_working_area(target, write_algorithm);
+	if (strobe_cfg)
+		target_free_working_area(target, strobe_cfg);
+
+	destroy_reg_param(&reg_params[0]);
+	destroy_reg_param(&reg_params[1]);
+	destroy_reg_param(&reg_params[2]);
+	destroy_reg_param(&reg_params[3]);
+	destroy_reg_param(&reg_params[4]);
+	destroy_reg_param(&reg_params[5]);
+	destroy_reg_param(&reg_params[6]);
+
+	return retval;
+}
+
+COMMAND_HANDLER(kinetis_margin_check_image_handler)
+{
+	if (CMD_ARGC < 2 || CMD_ARGC > 3)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	const char *filename = CMD_ARGV[0];
+	uint32_t addr;
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], addr);
+	uint8_t margin_level = 1;  /* default = USER margin */
+	if (CMD_ARGC == 3) {
+		uint8_t m;
+		COMMAND_PARSE_NUMBER(u8, CMD_ARGV[2], m);
+		if (m < 1 || m > 2) {
+			/* S32K1xx RM 31.4.12.3: PROGRAM_CHECK only accepts margin 1 (USER)
+			 * or 2 (FACTORY).  Margin 0 is reserved; using it gets ACCERR.
+			 * For a normal-margin readback compare, use verify_image instead. */
+			command_print(CMD, "margin must be 1 (USER) or 2 (FACTORY); for normal-margin readback use verify_image");
+			return ERROR_COMMAND_SYNTAX_ERROR;
+		}
+		margin_level = m;
+	}
+
+	/* Resolve bank by address. */
+	struct flash_bank *bank;
+	int retval = get_flash_bank_by_addr(get_current_target(CMD_CTX), addr, true, &bank);
+	if (retval != ERROR_OK)
+		return retval;
+	if (addr < bank->base) {
+		command_print(CMD, "address 0x%08" PRIx32 " is below bank base 0x%08" PRIx32,
+			addr, (uint32_t)bank->base);
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+	}
+	uint32_t offset = addr - bank->base;
+
+	/* Load file. */
+	struct image image;
+	image.base_address_set = true;
+	image.base_address = 0;
+	image.start_address_set = false;
+	retval = image_open(&image, filename, NULL);
+	if (retval != ERROR_OK) {
+		command_print(CMD, "could not open '%s'", filename);
+		return retval;
+	}
+
+	if (image.num_sections != 1) {
+		command_print(CMD, "margin_check_image needs a flat binary; got %u sections",
+			image.num_sections);
+		image_close(&image);
+		return ERROR_FAIL;
+	}
+
+	uint32_t size = image.sections[0].size;
+	if (size & 3) {
+		command_print(CMD, "file size %u is not longword-aligned", size);
+		image_close(&image);
+		return ERROR_FAIL;
+	}
+	uint32_t lwcount = size / 4;
+
+	uint8_t *buffer = malloc(size);
+	if (!buffer) {
+		image_close(&image);
+		return ERROR_FAIL;
+	}
+	size_t read_size;
+	retval = image_read_section(&image, 0, 0, size, buffer, &read_size);
+	image_close(&image);
+	if (retval != ERROR_OK || read_size != size) {
+		free(buffer);
+		return ERROR_FAIL;
+	}
+
+	command_print(CMD,
+		"margin_check_image: verifying %" PRIu32 " bytes (%" PRIu32
+		" longwords) at flash 0x%08" PRIx32 " with margin %u (%s)",
+		size, lwcount, addr, margin_level,
+		margin_level == 1 ? "USER" : "FACTORY");
+
+	retval = kinetis_margin_check_block(bank, buffer, offset, lwcount, margin_level);
+	free(buffer);
+
+	if (retval == ERROR_OK)
+		command_print(CMD, "margin_check_image: PASS");
+	else
+		command_print(CMD, "margin_check_image: FAIL (see log for failing address)");
+
+	return retval;
+}
+
 
 static int kinetis_protect(struct flash_bank *bank, int set, unsigned int first,
 		unsigned int last)
@@ -3697,6 +3940,13 @@ static const struct command_registration kinetis_exec_command_handlers[] = {
 			" Mode 'protection' is safe from unwanted locking of the device.",
 		.usage = "['protection'|'write']",
 		.handler = kinetis_fcf_source_handler,
+	},
+	{
+		.name = "margin_check_image",
+		.mode = COMMAND_EXEC,
+		.help = "Per-NXP-RM 31.4.12.3 PROGRAM_CHECK margin verify of a flat binary against a flash region. Picks up `kinetis ext_wdog_strobe` config so an external supervisor stays satisfied during the verify pass.",
+		.usage = "<file> <addr> [margin: 1=USER (default), 2=FACTORY]",
+		.handler = kinetis_margin_check_image_handler,
 	},
 	{
 		.name = "ext_wdog_strobe",

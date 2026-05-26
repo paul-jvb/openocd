@@ -6,7 +6,7 @@ CROSS_COMPILE ?= arm-none-eabi-
 AS      = $(CROSS_COMPILE)as
 OBJCOPY = $(CROSS_COMPILE)objcopy
 
-all: kinetis_flash.inc kinetis_phrase.inc
+all: kinetis_flash.inc kinetis_phrase.inc kinetis_margin_check.inc
 
 %.elf: %.s
 	$(AS) $< -o $@
