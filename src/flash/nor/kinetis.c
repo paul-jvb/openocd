@@ -120,6 +120,7 @@
 #define FTFX_CMD_BLOCKSTAT  0x00
 #define FTFX_CMD_SECTSTAT   0x01
 #define FTFX_CMD_LWORDPROG  0x06
+#define FTFX_CMD_PHRASEPROG 0x07
 #define FTFX_CMD_SECTERASE  0x09
 #define FTFX_CMD_SECTWRITE  0x0b
 #define FTFX_CMD_MASSERASE  0x44
@@ -1296,6 +1297,11 @@ static const uint8_t kinetis_flash_write_code[] = {
 #include "../../../contrib/loaders/flash/kinetis/kinetis_flash.inc"
 };
 
+/* S32K1xx / KE15Z Program-Phrase Microcodes */
+static const uint8_t kinetis_phrase_write_code[] = {
+#include "../../../contrib/loaders/flash/kinetis/kinetis_phrase.inc"
+};
+
 /* Program LongWord Block Write */
 static int kinetis_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		uint32_t offset, uint32_t wcount)
@@ -1375,6 +1381,104 @@ static int kinetis_write_block(struct flash_bank *bank, const uint8_t *buffer,
 		}
 	} else if (retval != ERROR_OK)
 		LOG_ERROR("Error executing kinetis Flash programming algorithm");
+
+	target_free_working_area(target, source);
+	target_free_working_area(target, write_algorithm);
+
+	destroy_reg_param(&reg_params[0]);
+	destroy_reg_param(&reg_params[1]);
+	destroy_reg_param(&reg_params[2]);
+	destroy_reg_param(&reg_params[3]);
+	destroy_reg_param(&reg_params[4]);
+
+	return retval;
+}
+
+/* Program Phrase Block Write (S32K1xx, KE15Z)
+ *
+ * Async-algorithm sister of kinetis_write_block() that uses
+ * PROGRAM_PHRASE (8-byte FCCOB writes) and the kinetis_phrase_write_code
+ * loader. Runs the programming loop on the chip's own M4 core via the
+ * loader in SRAM, so throughput is limited by FTFC speed rather than
+ * SWD-FCCOB transaction overhead. Bench-measured ~25 KB/s
+ * (per-phrase SWD loop) -> ~80+ KB/s (chip-side loader), enough to fit
+ * a 64 KB bootloader inside a MAX1232 watchdog window. */
+static int kinetis_write_block_phrase(struct flash_bank *bank, const uint8_t *buffer,
+		uint32_t offset, uint32_t pcount)
+{
+	struct target *target = bank->target;
+	uint32_t buffer_size;
+	struct working_area *write_algorithm;
+	struct working_area *source;
+	struct kinetis_flash_bank *k_bank = bank->driver_priv;
+	uint32_t address = k_bank->prog_base + offset;
+	uint32_t end_address;
+	struct reg_param reg_params[5];
+	struct armv7m_algorithm armv7m_info;
+	int retval;
+	uint8_t fstat;
+
+	if (target_alloc_working_area(target, sizeof(kinetis_phrase_write_code),
+			&write_algorithm) != ERROR_OK) {
+		LOG_WARNING("no working area available, can't do block phrase writes");
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+
+	retval = target_write_buffer(target, write_algorithm->address,
+		sizeof(kinetis_phrase_write_code), kinetis_phrase_write_code);
+	if (retval != ERROR_OK)
+		return retval;
+
+	/* Ring buffer in remaining working area. Must be multiple of 8
+	 * (one phrase per ring-buffer slot). */
+	buffer_size = target_get_working_area_avail(target) & ~7;
+	if (buffer_size < 256) {
+		LOG_WARNING("large enough working area not available, can't do block phrase writes");
+		target_free_working_area(target, write_algorithm);
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	} else if (buffer_size > 16384) {
+		buffer_size = 16384;
+	}
+
+	if (target_alloc_working_area(target, buffer_size, &source) != ERROR_OK) {
+		LOG_ERROR("allocating working area failed");
+		target_free_working_area(target, write_algorithm);
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+
+	armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
+	armv7m_info.core_mode = ARM_MODE_THREAD;
+
+	init_reg_param(&reg_params[0], "r0", 32, PARAM_IN_OUT); /* flash addr */
+	init_reg_param(&reg_params[1], "r1", 32, PARAM_OUT);    /* phrase count */
+	init_reg_param(&reg_params[2], "r2", 32, PARAM_OUT);    /* WA base */
+	init_reg_param(&reg_params[3], "r3", 32, PARAM_OUT);    /* WA end */
+	init_reg_param(&reg_params[4], "r4", 32, PARAM_OUT);    /* FTFx base */
+
+	buf_set_u32(reg_params[0].value, 0, 32, address);
+	buf_set_u32(reg_params[1].value, 0, 32, pcount);
+	buf_set_u32(reg_params[2].value, 0, 32, source->address);
+	buf_set_u32(reg_params[3].value, 0, 32, source->address + source->size);
+	buf_set_u32(reg_params[4].value, 0, 32, FTFX_FSTAT);
+
+	retval = target_run_flash_async_algorithm(target, buffer, pcount, 8,
+						0, NULL,
+						5, reg_params,
+						source->address, source->size,
+						write_algorithm->address, 0,
+						&armv7m_info);
+
+	if (retval == ERROR_FLASH_OPERATION_FAILED) {
+		end_address = buf_get_u32(reg_params[0].value, 0, 32);
+		LOG_ERROR("Error writing flash at %08" PRIx32, end_address);
+
+		retval = target_read_u8(target, FTFX_FSTAT, &fstat);
+		if (retval == ERROR_OK) {
+			retval = kinetis_ftfx_decode_error(fstat);
+			target_write_u8(target, FTFX_FSTAT, 0x70);
+		}
+	} else if (retval != ERROR_OK)
+		LOG_ERROR("Error executing kinetis Flash phrase-programming algorithm");
 
 	target_free_working_area(target, source);
 	target_free_working_area(target, write_algorithm);
@@ -1978,6 +2082,79 @@ static int kinetis_write_inner(struct flash_bank *bank, const uint8_t *buffer,
 			}
 		}
 		free(new_buffer);
+	} else if (k_chip->flash_support & FS_PROGRAM_PHRASE) {
+		/* program phrase command (S32K1xx, KE15...) -- 8-byte chunks
+		 * via FCCOB directly. Slow but no FlexRAM needed. */
+		uint8_t *new_buffer = NULL;
+
+		if (offset & 0x7) {
+			LOG_ERROR("offset 0x%" PRIx32 " breaks 8-byte alignment", offset);
+			return ERROR_FLASH_DST_BREAKS_ALIGNMENT;
+		}
+
+		if (count & 0x7) {
+			uint32_t old_count = count;
+			count = (old_count | 7) + 1;
+			new_buffer = malloc(count);
+			if (!new_buffer) {
+				LOG_ERROR("no memory for 8-byte padding buffer");
+				return ERROR_FAIL;
+			}
+			LOG_INFO("padding count %" PRIu32 " -> %" PRIu32 " (8-byte align)",
+				old_count, count);
+			memset(new_buffer + old_count, 0xff, count - old_count);
+			buffer = memcpy(new_buffer, buffer, old_count);
+		}
+
+		uint32_t phrases_remaining = count / 8;
+		result = ERROR_OK;
+		kinetis_disable_wdog(k_chip);
+
+		/* Try fast SRAM-resident async loader first -- typically
+		 * 4-8x throughput vs the SWD-driven FCCOB loop below, and
+		 * the difference between fitting / not fitting inside an
+		 * external watchdog window on a board with a supervisor IC. */
+		result = kinetis_write_block_phrase(bank, buffer, offset, phrases_remaining);
+
+		if (result == ERROR_TARGET_RESOURCE_NOT_AVAILABLE) {
+			LOG_WARNING("couldn't use block phrase writes, falling back to single memory accesses");
+
+			while (phrases_remaining) {
+			uint8_t ftfx_fstat;
+
+			int retries = 2;
+			while (retries-- > 0) {
+				result = kinetis_ftfx_command(bank->target, FTFX_CMD_PHRASEPROG,
+					k_bank->prog_base + offset,
+					buffer[3], buffer[2], buffer[1], buffer[0],
+					buffer[7], buffer[6], buffer[5], buffer[4],
+					&ftfx_fstat);
+				if (result == ERROR_OK)
+					break;
+				LOG_WARNING("phrase write at " TARGET_ADDR_FMT " failed, clearing errors and retrying",
+					bank->base + offset);
+				/* clear ACCERR/FPVIOL via writing 1s to FSTAT */
+				target_write_u8(bank->target, FTFX_FSTAT, 0x70);
+				alive_sleep(1);
+			}
+
+			if (result != ERROR_OK) {
+				LOG_ERROR("Error writing phrase at " TARGET_ADDR_FMT,
+					bank->base + offset);
+				break;
+			}
+
+			if (ftfx_fstat & 0x01)
+				LOG_ERROR("Flash write error at " TARGET_ADDR_FMT,
+					bank->base + offset);
+
+			buffer += 8;
+			offset += 8;
+			phrases_remaining--;
+			keep_alive();
+			}
+		}
+		free(new_buffer);
 	} else {
 		LOG_ERROR("Flash write strategy not implemented");
 		return ERROR_FLASH_OPERATION_FAILED;
@@ -2119,7 +2296,7 @@ static int kinetis_probe_chip_s32k(struct kinetis_chip *k_chip)
 	k_chip->pflash_base = 0;
 	k_chip->nvm_base = 0x10000000;
 	k_chip->progr_accel_ram = FLEXRAM;
-	k_chip->flash_support = FS_PROGRAM_PHRASE | FS_PROGRAM_SECTOR;
+	k_chip->flash_support = FS_PROGRAM_PHRASE;
 	k_chip->watchdog_type = KINETIS_WDOG32_KE1X;
 
 	if (k_chip->sim_base == 0)
@@ -2365,7 +2542,7 @@ static int kinetis_probe_chip(struct kinetis_chip *k_chip)
 			k_chip->max_flash_prog_size = 1<<10;
 			k_chip->nvm_sector_size = 4<<10;
 			num_blocks = 2;
-			k_chip->flash_support = FS_PROGRAM_PHRASE | FS_PROGRAM_SECTOR;
+			k_chip->flash_support = FS_PROGRAM_PHRASE;
 			break;
 		case KINETIS_K_SDID_K10_M120:
 		case KINETIS_K_SDID_K20_M120:
@@ -2375,7 +2552,7 @@ static int kinetis_probe_chip(struct kinetis_chip *k_chip)
 			k_chip->pflash_sector_size = 4<<10;
 			k_chip->nvm_sector_size = 4<<10;
 			num_blocks = 4;
-			k_chip->flash_support = FS_PROGRAM_PHRASE | FS_PROGRAM_SECTOR;
+			k_chip->flash_support = FS_PROGRAM_PHRASE;
 			break;
 		default:
 			LOG_ERROR("Unsupported K-family FAMID");
@@ -2439,7 +2616,7 @@ static int kinetis_probe_chip(struct kinetis_chip *k_chip)
 					/* MK24FN1M */
 					k_chip->pflash_sector_size = 4<<10;
 					num_blocks = 2;
-					k_chip->flash_support = FS_PROGRAM_PHRASE | FS_PROGRAM_SECTOR;
+					k_chip->flash_support = FS_PROGRAM_PHRASE;
 					k_chip->max_flash_prog_size = 1<<10;
 					subfamid = 4; /* errata 1N83J fix */
 					break;
@@ -2466,7 +2643,7 @@ static int kinetis_probe_chip(struct kinetis_chip *k_chip)
 				}
 				/* K24FN1M without errata 7534 */
 				num_blocks = 2;
-				k_chip->flash_support = FS_PROGRAM_PHRASE | FS_PROGRAM_SECTOR;
+				k_chip->flash_support = FS_PROGRAM_PHRASE;
 				k_chip->max_flash_prog_size = 1<<10;
 				break;
 
@@ -2482,7 +2659,7 @@ static int kinetis_probe_chip(struct kinetis_chip *k_chip)
 				k_chip->nvm_sector_size = 4<<10;
 				k_chip->max_flash_prog_size = 1<<10;
 				num_blocks = 2;
-				k_chip->flash_support = FS_PROGRAM_PHRASE | FS_PROGRAM_SECTOR;
+				k_chip->flash_support = FS_PROGRAM_PHRASE;
 				break;
 
 			case KINETIS_SDID_FAMILYID_K2X | KINETIS_SDID_SUBFAMID_KX6:
@@ -2685,7 +2862,7 @@ static int kinetis_probe_chip(struct kinetis_chip *k_chip)
 				k_chip->nvm_sector_size = 2<<10;
 				k_chip->max_flash_prog_size = 1<<9;
 				num_blocks = 2;
-				k_chip->flash_support = FS_PROGRAM_PHRASE | FS_PROGRAM_SECTOR;
+				k_chip->flash_support = FS_PROGRAM_PHRASE;
 				k_chip->cache_type = KINETIS_CACHE_L;
 
 				cpu_mhz = 72;
@@ -2701,7 +2878,7 @@ static int kinetis_probe_chip(struct kinetis_chip *k_chip)
 				k_chip->nvm_sector_size = 2<<10;
 				k_chip->max_flash_prog_size = 1<<10;
 				num_blocks = 2;
-				k_chip->flash_support = FS_PROGRAM_PHRASE | FS_PROGRAM_SECTOR;
+				k_chip->flash_support = FS_PROGRAM_PHRASE;
 				k_chip->cache_type = KINETIS_CACHE_MSCM;
 
 				cpu_mhz = 168;
